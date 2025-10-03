@@ -1,0 +1,15 @@
+{
+	"name": "deno-ts",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-toolsai.jupyter",
+				"justjavac.vscode-deno-extensionpack",
+				"vscode-icons-team.vscode-icons"
+			]
+		}
+	}
+}

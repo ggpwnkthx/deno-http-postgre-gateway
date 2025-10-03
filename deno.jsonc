@@ -1,0 +1,22 @@
+{
+  "$schema": "https://deno.land/x/deno/cli/schemas/config-file.v1.json",
+  "lock": false,
+  "tasks": {
+    "run": "deno run --allow-env --allow-net src/main.ts",
+    "dev": "deno run --watch --allow-env --allow-net --allow-read src/main.ts",
+    "check": "deno check src/main.ts",
+    "bench": "deno bench -A",
+    "test": "deno test -A"
+  },
+  "lint": { "rules": { "tags": ["recommended"] } },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true
+  },
+  "compilerOptions": {
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  }
+}
