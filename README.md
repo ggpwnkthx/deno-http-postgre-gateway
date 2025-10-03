@@ -6,6 +6,9 @@ A tiny, production-ready HTTP gateway for Deno v2.5+ that turns batched SQL into
 
 ## Table of Contents
 
+- [Why & When to Use This](#why--when-to-use-this)
+- [How It Works (End-to-End)](#how-it-works-end-to-end)
+- [Comparison to Similar Projects](#comparison-to-similar-projects)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Folder Structure](#folder-structure)
@@ -21,7 +24,7 @@ A tiny, production-ready HTTP gateway for Deno v2.5+ that turns batched SQL into
     - [CBOR](#cbor)
     - [CSV](#csv)
     - [Apache Arrow IPC](#apache-arrow-ipc)
-  - [Binary Values \u0026 Types](#binary-values--types)
+  - [Binary Values & Types](#binary-values--types)
 - [API](#api)
   - [POST /batch](#post-batch)
   - [Health](#health)
@@ -36,8 +39,68 @@ A tiny, production-ready HTTP gateway for Deno v2.5+ that turns batched SQL into
 - [CORS](#cors)
 - [Development](#development)
 - [Performance Tips](#performance-tips)
-- [Benchmarks \u0026 Tuning](#benchmarks--tuning)
+- [Benchmarks & Tuning](#benchmarks--tuning)
+- [Engineering Highlights](#engineering-highlights)
 - [Notes](#notes)
+
+---
+
+## Why & When to Use This
+
+**Short version:** this is a tiny, production-ready “SQL-in → streamed-rows-out” HTTP gateway for Postgres. It’s ideal when you want browser/CLI/data-pipeline clients to consume **very large** result sets *incrementally* with **backpressure**, low latency, and in the **wire format** that best fits each client (NDJSON, SSE, MessagePack, CBOR, CSV, Arrow IPC).
+
+### Why it’s useful
+
+- **Streams at the right abstraction level.** You keep full SQL power; the gateway focuses on *transport*: server-side cursors, per-statement timeouts, and efficient encoders. Great for internal tools, data exports, BI-style queries, analytics, and log/event viewers.
+- **Multiple wire formats, same pipeline.** Frontends use SSE for progressive rendering; CLIs love NDJSON/CSV; binary-heavy consumers get MessagePack/CBOR (typed bytes) or columnar **Arrow IPC** for analytics.
+- **Low latency & backpressure aware.** Built on `ReadableStream` with configurable `flushEvery` and `flushIntervalMs`. Tune for minimal latency or for throughput.
+- **Fast JSON path.** Rows are serialized once in the DB layer (prebuilt key fragments, custom scalar shaping for BigInt/Date/Uint8Array), then re-used by encoders via `emitRow` (no per-row `JSON.stringify` work in encoders).
+- **Operationally sane.** Single-statement enforcement (guards against `;` injection), PgBouncer-unsafe command detection, normalized connect-time errors (401/503/500), CORS, health/ready probes, and opt-in perf spans.
+- **Autocommit for read-only batches.** Each SELECT-like statement runs in its own short transaction for pool friendliness; mutations can be allowed/denied centrally and per request.
+
+### When you’d pick this
+
+- You’re building a **web UI** that renders data as it arrives (SSE/NDJSON), including *very* large results.
+- You need **CSV/Arrow exports** that don’t blow up memory and start downloading immediately.
+- You want a **single service** that can feed **frontends, CLIs, and batch jobs** by just flipping `Accept:`/`x-response-format`.
+- You run behind **PgBouncer** and need pooling‑friendly behavior with explicit transaction controls.
+
+### When you might pick something else
+
+- You need **policy/RLS-aware REST/GraphQL** and don’t want to ship SQL to the server → PostgREST/Hasura/PostGraphile.
+- You need **change streams** rather than ad-hoc query streams → Debezium/CDC.
+- You require **cross-db federation** or ORM-level abstractions → a higher-level API layer.
+
+---
+
+## How It Works (End-to-End)
+
+1. **Parse**: Auth (Basic or Bearer + `x-db-user`), headers (fetch size, flush, timeouts, format), and JSON body with `statements[]`. Enforces *single statement* per entry.
+2. **Plan**: Resolve PG env and build `getClient()` with TLS and a small retry budget.
+3. **Execute**:
+   - Read-only batch? Use **autocommit** (one short txn per statement). Otherwise wrap the whole batch in a single txn.
+   - SELECT-like → cursor stream calling `writer.emitRow(i, rowJson)`; non-SELECT → `execute()` and emit a summary.
+   - On cancel: rollback/close safely.
+4. **Stream**: The chosen encoder frames events and rows; NDJSON/SSE line encoders cache prefixes; MsgPack/CBOR batch rows as compact binary docs; Arrow accumulates rows per statement into record batches.
+5. **Finish**: Emit `committed`/`aborted`, close stream, and (optionally) log perf spans.
+
+See: `src/pipeline/request/handlers/batch.ts`, `src/pipeline/execute/*`, and `src/pipeline/stream/encoders/*`.
+
+---
+
+## Comparison to Similar Projects
+
+This gateway is a **streaming transport** focused on efficient delivery of SQL results; it doesn’t try to be your application API.
+
+| Category | These Projects | What they optimize for | How this gateway differs |
+|---|---|---|---|
+| Schema-to-API | **PostgREST**, **Supabase PostgREST** | RESTful resources over JSON with RLS/policies | We don’t map your schema; you send SQL. In return you get true row streaming in **six formats** and explicit txn/timeout control. |
+| GraphQL over Postgres | **Hasura**, **PostGraphile** | Typed GraphQL graph, authorization, subscriptions | We’re smaller/simpler. Pick us when your contract *is* SQL and you need efficient multi-format streaming to web/CLI/pipelines. |
+| Change data capture | **Debezium**, logical decoding | Continuous **change** streams | We stream **query results** on demand, not WAL changes. |
+| Direct driver usage | `pg`, `postgres.js`, Deno Postgres | App-embedded DB access | Centralizes streaming over **HTTP** with backpressure and a consistent error model; easier for browsers and heterogeneous clients. |
+| Columnar over gRPC | **Apache Arrow Flight** | Ultra-fast columnar via gRPC | We can still serve **Arrow IPC over HTTP** and also NDJSON/SSE/CSV without changing the server or clients that prefer text. |
+
+**TL;DR positioning:** If your pain is *moving lots of SQL result rows to varied clients smoothly*, this gateway is exactly that missing piece. If your pain is *designing an app-level API with auth/permissions and a query language*, use PostgREST/Hasura/PostGraphile instead.
 
 ---
 
@@ -147,7 +210,7 @@ The server listens on `http://localhost:${PORT}` (defaults to `8000`).
 
 - `READ_ONLY` (default `false`) – When `true`, mutations are disallowed unless explicitly permitted per request via header.  
 - `PGBOUNCER_MODE` (optional) – `"transaction"` or `"statement"` automatically enables PgBouncer strict checks; can be overridden by `PGBOUNCER_STRICT`.  
-- `PGBOUNCER_STRICT` (default depends on `PGBOUNCER_MODE`) – Rejects session-unsafe statements (`SET`, `LISTEN`, `COPY`, `BEGIN/COMMIT`, etc.).  
+- `PGBOUNCER_STRICT` (default depends on `PGBOUNCER_MODE`) – Rejects session-unsafe statements (`SET`, `LISTEN/UNLISTEN`, `NOTIFY`, `COPY ... STDIN/STDOUT`, `BEGIN/COMMIT/ROLLBACK`, savepoints).  
 - `AUTOCOMMIT_READONLY` (default `true`) – Run **read-only batches** as **autocommit** (one short txn per statement).  
 - `READY_CHECK_DB` (default `false`) – If `true`, `/ready` probes DB using `PGREADY_USER`/`PGREADY_PASSWORD`.
 
@@ -174,8 +237,8 @@ All custom headers use **lowercase** on the wire:
 | `x-statement-timeout-ms` | number | Global `statement_timeout` in ms. |
 | `x-lock-timeout-ms` | number | Global `lock_timeout` in ms. |
 | `x-idle-in-txn-timeout-ms` | number | Global `idle_in_transaction_session_timeout` in ms. |
-| `x-statement-timeout-per-index` | map | Per-statement override, e.g. `"0=100,2=500"`. |
-| `x-lock-timeout-per-index` | map | Per-statement override, e.g. `"1=250"`. |
+| `x-statement-timeout-per-index` | map | Per-statement override, e.g., `"0=100,2=500"`. |
+| `x-lock-timeout-per-index` | map | Per-statement override, e.g., `"1=250"`. |
 | `x-allow-mutations` | bool | Overrides read-only mode when `READ_ONLY=1`. |
 | `x-perf-debug` | bool | Enables per-request perf logging. |
 
@@ -260,7 +323,7 @@ If both are provided, `x-response-format` wins.
 
 The gateway normalizes some JS types to ensure consistent wire representations:
 
-- **BigInt** → string (e.g. `"9007199254740993"`)
+- **BigInt** → string (e.g., `"9007199254740993"`)
 - **Date** → ISO string (UTC) via `.toISOString()`
 - **Uint8Array/ArrayBuffer** → `"base64:..."` **only in JSON/CSV** encodings (NDJSON/SSE/CSV)  
   - **MessagePack/CBOR**: binary is decoded back into `Uint8Array` (typed bytes).  
@@ -324,68 +387,38 @@ NDJSON-style objects (exact same shapes are used as the `data` for SSE and as th
 ### Examples: NDJSON
 
 ```bash
-curl -sN \
-  -H "authorization: Basic $(printf 'alice:secret' | base64)" \
-  -H "content-type: application/json" \
-  -H "x-response-format: ndjson" \
-  -X POST http://localhost:8000/batch \
-  --data '{"statements":[{"sql":"select 1 as n"}]}'
+curl -sN   -H "authorization: Basic $(printf 'alice:secret' | base64)"   -H "content-type: application/json"   -H "x-response-format: ndjson"   -X POST http://localhost:8000/batch   --data '{"statements":[{"sql":"select 1 as n"}]}'
 ```
 
 ### Examples: SSE
 
 ```bash
-curl -sN \
-  -H "authorization: Basic $(printf 'alice:secret' | base64)" \
-  -H "content-type: application/json" \
-  -H "accept: text/event-stream" \
-  -X POST http://localhost:8000/batch \
-  --data '{"statements":[{"sql":"select generate_series(1,5) as n"}]}'
+curl -sN   -H "authorization: Basic $(printf 'alice:secret' | base64)"   -H "content-type: application/json"   -H "accept: text/event-stream"   -X POST http://localhost:8000/batch   --data '{"statements":[{"sql":"select generate_series(1,5) as n"}]}'
 ```
 
 ### Examples: MessagePack
 
 ```bash
 # Save binary response to a file
-curl -sN \
-  -H "authorization: Basic $(printf 'alice:secret' | base64)" \
-  -H "content-type: application/json" \
-  -H "x-response-format: msgpack" \
-  -X POST http://localhost:8000/batch \
-  --data '{"statements":[{"sql":"select 1 as n"}]}' > out.msgpack
+curl -sN   -H "authorization: Basic $(printf 'alice:secret' | base64)"   -H "content-type: application/json"   -H "x-response-format: msgpack"   -X POST http://localhost:8000/batch   --data '{"statements":[{"sql":"select 1 as n"}]}' > out.msgpack
 ```
 
 ### Examples: CBOR
 
 ```bash
-curl -sN \
-  -H "authorization: Basic $(printf 'alice:secret' | base64)" \
-  -H "content-type: application/json" \
-  -H "x-response-format: cbor" \
-  -X POST http://localhost:8000/batch \
-  --data '{"statements":[{"sql":"select 1 as n"}]}' > out.cbor
+curl -sN   -H "authorization: Basic $(printf 'alice:secret' | base64)"   -H "content-type: application/json"   -H "x-response-format: cbor"   -X POST http://localhost:8000/batch   --data '{"statements":[{"sql":"select 1 as n"}]}' > out.cbor
 ```
 
 ### Examples: CSV
 
 ```bash
-curl -sN \
-  -H "authorization: Basic $(printf 'alice:secret' | base64)" \
-  -H "content-type: application/json" \
-  -H "x-response-format: csv" \
-  -X POST http://localhost:8000/batch \
-  --data '{"statements":[{"sql":"select 1 as n"}]}' | head -20
+curl -sN   -H "authorization: Basic $(printf 'alice:secret' | base64)"   -H "content-type: application/json"   -H "x-response-format: csv"   -X POST http://localhost:8000/batch   --data '{"statements":[{"sql":"select 1 as n"}]}' | head -20
 ```
 
 ### Examples: Apache Arrow IPC
 
 ```bash
-curl -sN \
-  -H "authorization: Basic $(printf 'alice:secret' | base64)" \
-  -H "content-type: application/json" \
-  -H "x-response-format: arrow" \
-  -X POST http://localhost:8000/batch \
-  --data '{"statements":[{"sql":"select 1 as n"}]}' > out.arrow
+curl -sN   -H "authorization: Basic $(printf 'alice:secret' | base64)"   -H "content-type: application/json"   -H "x-response-format: arrow"   -X POST http://localhost:8000/batch   --data '{"statements":[{"sql":"select 1 as n"}]}' > out.arrow
 ```
 
 > **Client decoding tips**
@@ -435,7 +468,7 @@ For `401` with missing credentials, you may receive a helpful `hint`:
 - Allowed origins: `*`  
 - Allowed methods: `GET, POST, OPTIONS`  
 - Allowed headers:  
-  `authorization, content-type, x-db-user, x-statement-timeout-ms, x-statement-timeout-per-index, x-lock-timeout-ms, x-lock-timeout-per-index, x-idle-in-txn-timeout-ms, x-fetch-size, x-flush-every, x-flush-interval-ms, x-response-format, x-app-name, x-allow-mutations, x-perf-debug`
+  `authorization, content-type, x-db-user, x-statement-timeout-ms, x-statement-timeout-per-index, x-lock-timeout-ms, x-lock-timeout-per-index, x-idle-in-transaction-timeout-ms, x-fetch-size, x-flush-every, x-flush-interval-ms, x-response-format, x-app-name, x-allow-mutations, x-perf-debug`
 
 Preflight responses return `204` with a max-age of 86400 seconds.
 
@@ -493,6 +526,16 @@ deno bench -A bench/stream_formats.bench.ts
 
 ---
 
+## Engineering Highlights
+
+- **Zero-copy minded JSON**: `rowArrayToJsonFast` builds row objects as strings with pre-cached `"col":` fragments; encoders reuse the same JSON (no extra parse/stringify).
+- **Typed binary path**: JSON encoders mark bytes as `"base64:…"`, while MsgPack/CBOR revive to `Uint8Array` so clients get true typed arrays.
+- **PgBouncer safety net**: lightweight SQL scanners detect top-level commands and reject session-unsafe ones when strict mode is on.
+- **Cancellation that actually cleans up**: on stream cancel, roll back if needed and always `end()` the client.
+- **Perf spans**: opt-in, structured logs with counters/heap deltas to spot encoder/flush hotspots.
+
+---
+
 ## Notes
 
 - **Transaction model**
@@ -508,4 +551,3 @@ deno bench -A bench/stream_formats.bench.ts
 - **Perf instrumentation**
   - Toggle with header `x-perf-debug: 1` or env `PERF_DEBUG=1`.  
   - Logs JSON lines (`level=debug`, `event=perf`) with span durations and optional heap metrics.
-
