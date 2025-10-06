@@ -45,7 +45,8 @@ export async function runBatch(args: {
   }
 
   for (let i = 0; i < plan.statements.length; i++) {
-    if (state.cancelled) break;
+    // Do **not** break on state.cancelled: complete DB work deterministically.
+    // The stream may already be closed by the client, but DB-side work should finish.
 
     // Effective per-statement timeouts (per-index overrides → global defaults)
     const perStmt = plan.timeouts.perIndexStatement?.[i] ?? plan.timeouts.statementMs;
@@ -63,7 +64,7 @@ export async function runBatch(args: {
     });
 
     const doWork = async () => {
-      if (state.cancelled) return;
+      // Even if cancelled, execute to keep transactional semantics/logging intact.
       await executeStatement({
         client,
         plan,
@@ -83,7 +84,7 @@ export async function runBatch(args: {
     spanStmt?.end();
   }
 
-  if (!autocommit && !state.cancelled) {
+  if (!autocommit) {
     const spanCommit = plan.perf?.span("batch.commit_tx");
     await client.commit();
     state.inTx = false;

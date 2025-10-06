@@ -8,8 +8,13 @@ export { decodeBase64 } from "jsr:@std/encoding@1/base64";
 export { Client, type ClientOptions } from "jsr:@db/postgres";
 
 // --- Binary encodings
-export { encode as msgpackEncode } from "npm:@msgpack/msgpack@^3";
+export {
+  decode as msgpackDecode,
+  encode as msgpackEncode,
+  type ValueMap as msgpackValueMap,
+  type ValueType as msgpackValueType,
+} from "jsr:@std/msgpack@^1";
 export { encode as cborEncode } from "npm:cbor-x@^1";
 
 // --- Apache Arrow (IPC)
-export { RecordBatchWriter, tableFromJSON } from "npm:apache-arrow@15.0.2";
+export { RecordBatchReader, RecordBatchWriter, tableFromJSON } from "npm:apache-arrow@^21";

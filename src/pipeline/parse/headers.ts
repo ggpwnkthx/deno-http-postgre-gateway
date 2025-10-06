@@ -67,10 +67,11 @@ export function getResponseFormat(h: Headers, accept: string | null): ResponseFo
       .map((t) => t.trim().toLowerCase())
       .filter(Boolean);
 
-    if (tokens.includes("text/event-stream")) return "sse";
+    // Prefer NDJSON when both NDJSON and SSE are present (common case).
     if (tokens.includes("application/x-ndjson") || tokens.includes("application/ndjson")) {
       return "ndjson";
     }
+    if (tokens.includes("text/event-stream")) return "sse";
     if (tokens.includes("application/x-msgpack") || tokens.includes("application/msgpack")) {
       return "msgpack";
     }

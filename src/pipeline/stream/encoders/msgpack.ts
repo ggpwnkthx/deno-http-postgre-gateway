@@ -1,24 +1,22 @@
 import { createChunkStream } from "./base.ts";
 import type { StreamEncoder } from "./types.ts";
 import type { PerfCtx } from "../../../shared/perf.ts";
-import { msgpackEncode } from "../../../deps.ts";
+import {
+  msgpackEncode,
+  type msgpackValueMap as ValueMap,
+  type msgpackValueType as ValueType,
+} from "../../../deps.ts";
 
 /**
- * MessagePack streaming with record batching.
+ * MessagePack streaming with record batching (@std/msgpack).
  *
- * Wire notes:
- * - Rows are batched into a single MsgPack document shaped as:
- *     { rows: [ { statement: number, row: <object> }, ... ] }
- * - Non-row events are emitted as standalone MsgPack documents.
+ * Modes:
+ * - Receives native arrays/objects and directly encodes them (no JSON.parse).
+ * - Binary columns (Uint8Array) stay binary.
  *
- * Batching policy:
- * - batchSize = flushEvery (if > 0) else 1024 (default)
- * - Flush pending rows BEFORE emitting any non-row event to preserve ordering.
- * - Always flush remaining rows on close().
- *
- * Performance:
- * - Fast-path JSON.parse (no reviver) unless we see "base64:".
- * - Only rebuild Uint8Array when base64 sentinel is present.
+ * Batching:
+ * - batchSize = flushEvery (if > 0) else 1024
+ * - Remaining rows are flushed on close().
  */
 export function createMsgpackEncoder(
   flushEvery: number,
@@ -29,55 +27,46 @@ export function createMsgpackEncoder(
   const { stream, pushBytes, close } = createChunkStream(
     flushEvery,
     flushIntervalMs,
+    undefined,
     onCancel,
     perf,
   );
 
   const batchSize = flushEvery > 0 ? flushEvery : 1024;
 
-  type RowItem = { statement: number; row: unknown };
-  let rowsBatch: RowItem[] = [];
+  type RowItem = { statement: number; row: ValueType };
+  const rowsBatch: RowItem[] = [];
 
-  function hasBase64Sentinel(s: string) {
-    return s.indexOf("base64:") !== -1;
-  }
-
-  function flushRowsBatch() {
-    if (rowsBatch.length === 0) return;
+  const flushRowsBatch = () => {
+    if (!rowsBatch.length) return;
     try {
-      pushBytes(msgpackEncode({ rows: rowsBatch }));
+      const doc: ValueMap = { rows: rowsBatch as unknown as ReadonlyArray<ValueType> };
+      pushBytes(msgpackEncode(doc));
     } finally {
       rowsBatch.length = 0;
     }
-  }
+  };
 
   return {
     stream,
-    emit: (_type, payload) => {
-      // Preserve ordering: flush any pending row batch first
-      flushRowsBatch();
-      try {
-        pushBytes(msgpackEncode(payload));
-      } catch (e) {
-        // Keep stream valid even if encoding of payload fails
-        pushBytes(msgpackEncode({ error: String(e) }));
-      }
-    },
-    emitRow: (i, rowJson) => {
-      let row: unknown;
-      try {
-        row = hasBase64Sentinel(rowJson)
-          ? JSON.parse(rowJson, jsonReviverFast)
-          : JSON.parse(rowJson);
-      } catch {
-        row = rowJson;
-      }
 
-      rowsBatch.push({ statement: i, row });
-      if (rowsBatch.length >= batchSize) {
-        flushRowsBatch();
-      }
+    // Array fast path
+    emitArrayRow: (i, row) => {
+      rowsBatch.push({ statement: i, row: row as ValueType });
+      if (rowsBatch.length >= batchSize) flushRowsBatch();
     },
+
+    // Compact stream shape: only "row" events are encoded.
+    emit: (type, payload) => {
+      if (type !== "row" || !payload || typeof payload !== "object") return;
+      const { statement, row } = payload as { statement: number; row: unknown };
+      rowsBatch.push({ statement, row: row as ValueType });
+      if (rowsBatch.length >= batchSize) flushRowsBatch();
+    },
+
+    preferArrays: true,
+    preferObjects: true,
+
     close: () => {
       try {
         flushRowsBatch();
@@ -86,20 +75,4 @@ export function createMsgpackEncoder(
       }
     },
   };
-}
-
-/** Inverse of jsonReplacer for base64:… only (typed binary revival). */
-function jsonReviverFast(_k: string, v: unknown) {
-  if (typeof v === "string" && v.startsWith("base64:")) {
-    const b64 = v.slice(7);
-    try {
-      const bin = atob(b64);
-      const u8 = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-      return u8;
-    } catch {
-      return v;
-    }
-  }
-  return v as unknown;
 }

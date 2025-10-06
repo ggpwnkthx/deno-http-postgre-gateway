@@ -48,21 +48,30 @@ export interface QuerySummary {
   rowCount: number | null;
 }
 
+/**
+ * Stream rows from a server-side cursor.
+ *
+ * Modes:
+ * - opts.as === "json": onRow receives a pre-serialized JSON string (zero parse).
+ * - opts.as === "object": onRow receives a plain object with native values.
+ * - opts.as === "array": onRow receives an array of column values (no per-row POJO).
+ *
+ * When available, the implementation SHOULD call onSchema(columns) once per statement
+ * before streaming rows (for "array" or "object" modes that can leverage columns).
+ */
 export interface DbClient {
   begin(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
   execute(sql: string, params?: unknown[]): Promise<QuerySummary>;
+
   streamRows(
     sql: string,
     params: unknown[] | undefined,
     fetchSize: number,
-    /**
-     * If the encoder supports a fast path, it may pass a function that
-     * accepts a **pre-serialized** JSON object string (no trailing newline).
-     * Otherwise, a plain object is acceptable.
-     */
-    onRow: (row: Record<string, unknown> | string) => void,
+    onRow: (row: Record<string, unknown> | string | unknown[]) => void,
+    opts?: { as?: "json" | "object" | "array"; onSchema?: (columns: string[]) => void },
   ): Promise<QuerySummary>;
+
   end(): Promise<void>;
 }

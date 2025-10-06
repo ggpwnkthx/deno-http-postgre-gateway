@@ -27,19 +27,63 @@ export async function executeStatement(args: {
   if (isSelect) {
     let rowCount = 0;
     const spanStream = plan.perf?.span("statement.stream", { index });
+
+    // Choose the most efficient delivery form supported by the encoder.
+    const wantsArrays = writer.preferArrays === true;
+    const wantsObjects = writer.preferObjects === true && !wantsArrays; // arrays win
+
+    // We'll capture schema if provided so we can fallback safely if needed.
+    let cols: string[] | null = null;
+
     const summary = await client.streamRows(
       spec.sql,
       spec.params,
       plan.fetchSize,
       (row) => {
         rowCount++;
-        if (typeof row === "string" && writer.emitRow) {
+        // Fast path for text encoders (NDJSON/SSE): they get pre-serialized strings.
+        if (!wantsArrays && !wantsObjects && typeof row === "string" && writer.emitRow) {
           writer.emitRow(index, row);
-        } else {
-          writer.emit("row", evt.row(index, row as Record<string, unknown>));
+          return;
         }
+
+        // Arrays preferred path
+        if (wantsArrays && Array.isArray(row)) {
+          if (typeof writer.emitArrayRow === "function") {
+            writer.emitArrayRow(index, row as unknown[]);
+            return;
+          }
+          // Fallback: map to object if encoder didn't implement emitArrayRow
+          if (cols) {
+            const obj: Record<string, unknown> = {};
+            for (let i = 0; i < cols.length; i++) obj[cols[i]] = (row as unknown[])[i];
+            writer.emit("row", evt.row(index, obj));
+            return;
+          }
+        }
+
+        // Object mode (native objects)
+        if (wantsObjects && row && typeof row === "object" && !Array.isArray(row)) {
+          writer.emit("row", evt.row(index, row as Record<string, unknown>));
+          return;
+        }
+
+        // Last-resort compatibility: stringify unknowns
+        writer.emit("row", evt.row(index, { value: row as unknown }));
+      },
+      {
+        as: wantsArrays ? "array" : (wantsObjects ? "object" : "json"),
+        onSchema: (c) => {
+          cols = c;
+          try {
+            writer.onSchema?.(index, c);
+          } catch {
+            // ignore encoder schema hook errors
+          }
+        },
       },
     );
+
     spanStream?.mark("rowCount", rowCount);
     spanStream?.end();
     writer.emit("summary", evt.summary(index, summary));

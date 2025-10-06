@@ -7,6 +7,42 @@
 import { isWordChar, isWordCharOrDigit } from "./char.ts";
 import { findClosingDollar, readDollarTag } from "./dollar.ts";
 
+const COMMAND_WORDS = new Set([
+  // DML
+  "select",
+  "insert",
+  "update",
+  "delete",
+  "values",
+  "merge",
+  // Utility-ish / misc (for detection/guarding elsewhere)
+  "table",
+  "show",
+  "explain",
+  "call",
+  "do",
+  "create",
+  "alter",
+  "drop",
+  "truncate",
+  "grant",
+  "revoke",
+  "set",
+  "listen",
+  "unlisten",
+  "notify",
+  "prepare",
+  "deallocate",
+  "copy",
+  "begin",
+  "commit",
+  "rollback",
+  "savepoint",
+  "release",
+  "analyze",
+  "vacuum",
+]);
+
 export function firstTopLevelCommand(sql: string): string | null {
   const s = sql.trim();
   const n = s.length;
@@ -14,6 +50,7 @@ export function firstTopLevelCommand(sql: string): string | null {
   let inS = false, inD = false, inLine = false, inBlock = false;
   let dollarTag: string | null = null;
   let depth = 0;
+  let skippingCte = false;
 
   function readWord(): string {
     const start = i;
@@ -120,11 +157,28 @@ export function firstTopLevelCommand(sql: string): string | null {
     // At top level, look for command words.
     if (depth === 0 && isWordChar(c)) {
       const word = readWord();
+
       if (word === "with") {
-        // Skip entire CTE list; keep scanning for the real leading command.
+        skippingCte = true;
         continue;
       }
-      return word;
+
+      if (skippingCte) {
+        // Skip CTE names and 'recursive'; resume when we see a true command word.
+        if (word === "recursive") continue;
+        if (COMMAND_WORDS.has(word)) {
+          skippingCte = false;
+          return word;
+        }
+        // Not a command word → it's part of CTE list; keep scanning.
+        continue;
+      }
+
+      // Normal path: return only recognized command words.
+      if (COMMAND_WORDS.has(word)) return word;
+
+      // Unknown token at top-level; continue scanning rather than returning garbage.
+      continue;
     }
 
     i++;

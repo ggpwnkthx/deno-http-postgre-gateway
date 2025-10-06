@@ -12,6 +12,7 @@ function nextCursorName() {
 /** Base64 encode Uint8Array without huge apply() frames. */
 function toBase64(u8: Uint8Array): string {
   let bin = "";
+  // NOTE: Plain loop is consistently fast and GC-light in V8.
   for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
   // btoa expects Latin-1 strings; this is ok for raw bytes.
   return btoa(bin);
@@ -66,7 +67,9 @@ export function toDbClientAPI(client: PgClient): DbClient {
       const rowCount = (res as unknown as { rowCount?: number }).rowCount ?? null;
       return { command, rowCount };
     },
-    async streamRows(sql, params, fetchSize, onRow) {
+
+    async streamRows(sql, params, fetchSize, onRow, opts): Promise<QuerySummary> {
+      const mode = opts?.as ?? "json";
       const cursor = nextCursorName();
 
       await client.queryArray({
@@ -82,40 +85,73 @@ export function toDbClientAPI(client: PgClient): DbClient {
         };
         const cols = anyPeek.rowDescription?.columns?.map((c) => c.name);
 
-        let useObjectMode = true;
-        let colKeyParts: string[] | null = null;
-
-        if (Array.isArray(cols) && cols.length > 0) {
-          useObjectMode = false;
-          colKeyParts = buildColKeyParts(cols);
+        const haveCols = Array.isArray(cols) && cols.length > 0;
+        if (haveCols && typeof opts?.onSchema === "function") {
+          // Inform downstream encoder/executor once per statement.
+          opts.onSchema(cols!);
         }
 
+        const colKeyParts = haveCols ? buildColKeyParts(cols!) : null;
+
         while (true) {
-          if (useObjectMode) {
-            // Object mode for drivers that don't expose rowDescription on array mode.
+          if (mode === "array") {
+            // Pure array mode: no per-row object creation here.
+            const res = await client.queryArray(`FETCH FORWARD ${fetchSize} FROM ${cursor}`);
+            const rows = (res as unknown as { rows: unknown[][] }).rows;
+            if (rows.length === 0) break;
+            for (const r of rows) onRow(r as unknown[]);
+            if (rows.length < fetchSize) break;
+            continue;
+          }
+
+          if (mode === "object") {
+            if (haveCols) {
+              // Array mode + manual mapping to POJO → no JSON stringify/parse.
+              const res = await client.queryArray(`FETCH FORWARD ${fetchSize} FROM ${cursor}`);
+              const rows = (res as unknown as { rows: unknown[][] }).rows;
+              if (rows.length === 0) break;
+
+              const names = cols!;
+              for (const row of rows) {
+                const r = row as unknown[];
+                const obj: Record<string, unknown> = {};
+                for (let i = 0; i < names.length; i++) obj[names[i]] = r[i];
+                onRow(obj);
+              }
+              if (rows.length < fetchSize) break;
+              continue;
+            } else {
+              // Fallback: driver object mode when rowDescription isn't available.
+              const objRes = await client.queryObject<Record<string, unknown>>(
+                `FETCH FORWARD ${fetchSize} FROM ${cursor}`,
+              );
+              if (objRes.rows.length === 0) break;
+              for (const row of objRes.rows) onRow(row);
+              if (objRes.rows.length < fetchSize) break;
+              continue;
+            }
+          }
+
+          // mode === "json" (pre-serialized JSON for text encoders)
+          if (haveCols) {
+            const res = await client.queryArray(`FETCH FORWARD ${fetchSize} FROM ${cursor}`);
+            const rows = (res as unknown as { rows: unknown[][] }).rows;
+            if (rows.length === 0) break;
+            const parts = colKeyParts!;
+            for (const row of rows) {
+              onRow(rowArrayToJsonFast(parts, row as unknown[]));
+            }
+            if (rows.length < fetchSize) break;
+            continue;
+          } else {
             const objRes = await client.queryObject<Record<string, unknown>>(
               `FETCH FORWARD ${fetchSize} FROM ${cursor}`,
             );
             if (objRes.rows.length === 0) break;
-            for (const row of objRes.rows) {
-              (onRow as unknown as (row: string) => void)(JSON.stringify(row));
-            }
+            for (const row of objRes.rows) onRow(JSON.stringify(row));
             if (objRes.rows.length < fetchSize) break;
             continue;
           }
-
-          // Fast array mode with precomputed key parts.
-          const res = await client.queryArray(`FETCH FORWARD ${fetchSize} FROM ${cursor}`);
-          const rows = (res as unknown as { rows: unknown[][] }).rows;
-          if (rows.length === 0) break;
-
-          const parts = colKeyParts!;
-          for (const row of rows) {
-            const json = rowArrayToJsonFast(parts, row as unknown[]);
-            (onRow as unknown as (row: string) => void)(json);
-          }
-
-          if (rows.length < fetchSize) break;
         }
 
         return { command: "SELECT", rowCount: null };
@@ -127,6 +163,7 @@ export function toDbClientAPI(client: PgClient): DbClient {
         }
       }
     },
+
     async end() {
       await client.end();
     },

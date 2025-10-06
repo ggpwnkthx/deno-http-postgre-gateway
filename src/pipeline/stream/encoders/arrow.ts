@@ -1,3 +1,4 @@
+// src/pipeline/stream/encoders/arrow.ts
 import { createChunkStream } from "./base.ts";
 import type { StreamEncoder } from "./types.ts";
 import type { PerfCtx } from "../../../shared/perf.ts";
@@ -6,19 +7,16 @@ import { RecordBatchWriter, tableFromJSON } from "../../../deps.ts";
 /**
  * Apache Arrow IPC streaming encoder with record batching.
  *
- * Strategy:
- *  - Accumulate rows per statement (as plain JS objects).
- *  - When a per-statement buffer reaches BATCH_ROWS, convert that slice to a Table,
- *    write it through a RecordBatchWriter (IPC stream format), and enqueue produced chunks.
- *  - On the statement's 'summary' event, flush any remaining rows.
- *  - Non-row events are ignored (Arrow is row-data centric).
+ * Perf characteristics:
+ * - Batches arrays/objects/JSON-strings; single parse per JSON batch.
+ * - Byte-aware early flush for JSON accumulation to cap peak memory.
+ * - Larger default batch size when flushEvery=0 (protected by byte ceiling).
  *
- * Notes:
- *  - We intentionally create a new RecordBatchWriter per flushed batch. This yields
- *    multiple IPC streams back-to-back for a statement. Most consumers can read
- *    concatenated streams; if you need a single logical stream per statement,
- *    consider a future refactor that keeps one writer open per statement and
- *    buffers chunks until `.finish()`.
+ * Inputs:
+ *  - onSchema(i, cols)           -> names for array rows
+ *  - emitArrayRow(i, any[])      -> array rows; mapped to objects per batch
+ *  - emit("row", {row: object})  -> object rows
+ *  - emitRow(i, jsonString)      -> JSON-string rows; single-parse per batch
  */
 export function createArrowIpcEncoder(
   flushEvery: number,
@@ -29,92 +27,213 @@ export function createArrowIpcEncoder(
   const { stream, pushBytes, close } = createChunkStream(
     flushEvery,
     flushIntervalMs,
+    undefined,
     onCancel,
     perf,
   );
 
-  // Pick batch size: prefer flushEvery when provided, else a sensible default.
-  const BATCH_ROWS = flushEvery > 0 ? flushEvery : 2048;
+  // Batch sizing:
+  const BATCH_ROWS = flushEvery > 0 ? flushEvery : 4096;
 
-  // Accumulate rows by statement index
-  const rowsByStmt = new Map<number, Array<Record<string, unknown>>>();
+  // Cap JSON accumulation to avoid building huge intermediate strings.
+  const JSON_MAX_BYTES = 8 * 1024 * 1024; // 8 MiB
 
-  async function flushStatementBatch(i: number) {
-    const rows = rowsByStmt.get(i);
-    if (!rows || rows.length === 0) return;
+  type Buckets = {
+    cols?: string[];
+    arrayRows: unknown[][];
+    objectRows?: Record<string, unknown>[];
+    jsonRows?: string[];
+    jsonBytes: number;
+  };
 
-    // Convert just this batch of JSON rows to an Arrow Table
-    const table = tableFromJSON(rows);
+  const byStmt = new Map<number, Buckets>();
 
-    // Emit a new IPC stream for this table
-    const writer = new RecordBatchWriter();
-    await writer.writeAll(table).finish();
+  const ensureBucket = (i: number): Buckets => {
+    let b = byStmt.get(i);
+    if (!b) {
+      b = { arrayRows: [], jsonBytes: 0 };
+      byStmt.set(i, b);
+    }
+    return b;
+  };
 
-    for await (const chunk of writer) {
-      pushBytes(chunk);
+  // --- Conversions -----------------------------------------------------------
+
+  function toObjectsFromArrays(cols: string[] | undefined, rows: unknown[][]) {
+    if (rows.length === 0) return [] as Record<string, unknown>[];
+    const names = cols ?? rows[0].map((_v, idx) => `col${idx + 1}`);
+    const out = new Array<Record<string, unknown>>(rows.length);
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      const obj: Record<string, unknown> = {};
+      for (let c = 0; c < names.length; c++) obj[names[c]] = row[c];
+      out[r] = obj;
+    }
+    return out;
+  }
+
+  /** Single-parse JSON rows per batch via `JSON.parse("[" + rows.join(",") + "]")`. */
+  function toObjectsFromJsonBatch(jsonRows: string[]) {
+    if (jsonRows.length === 0) return [] as Record<string, unknown>[];
+    const asArray = `[${jsonRows.join(",")}]`;
+    try {
+      const parsed = JSON.parse(asArray) as Array<unknown>;
+      for (let i = 0; i < parsed.length; i++) {
+        const v = parsed[i];
+        if (!v || typeof v !== "object" || Array.isArray(v)) {
+          parsed[i] = { value: v as unknown };
+        }
+      }
+      return parsed as Record<string, unknown>[];
+    } catch {
+      // Fallback per-row parse for robustness.
+      const out = new Array<Record<string, unknown>>(jsonRows.length);
+      for (let i = 0; i < jsonRows.length; i++) {
+        try {
+          const v = JSON.parse(jsonRows[i]);
+          out[i] = v && typeof v === "object" && !Array.isArray(v)
+            ? (v as Record<string, unknown>)
+            : { value: v as unknown };
+        } catch {
+          out[i] = { value: jsonRows[i] as unknown };
+        }
+      }
+      return out;
+    }
+  }
+
+  // --- Serialization ---------------------------------------------------------
+
+  function emitTableIpc(rows: Record<string, unknown>[]) {
+    if (!rows.length) return;
+
+    let u8: Uint8Array | null = null;
+
+    try {
+      const table = tableFromJSON(rows);
+
+      // Strategy 1: Prefer Table.serialize({ format: "stream" }) if available.
+      const anyTable = table as unknown as { serialize?: (opts?: unknown) => Uint8Array };
+      if (typeof anyTable?.serialize === "function") {
+        try {
+          u8 = anyTable.serialize({ format: "stream" });
+        } catch {
+          try {
+            u8 = anyTable.serialize();
+          } catch {
+            // fall through to writer fallback
+          }
+        }
+      }
+
+      // Strategy 2: RecordBatchWriter fallback.
+      if (!u8) {
+        try {
+          const writer = new RecordBatchWriter();
+          writer.writeAll(table);
+          if (typeof writer?.toUint8Array === "function") {
+            u8 = writer.toUint8Array(true); // finalize + contiguous buffer
+          }
+        } catch {
+          // give up gracefully
+        }
+      }
+    } catch {
+      // tableFromJSON failed; keep u8 null
     }
 
-    // Reset buffer for this statement
-    rows.length = 0;
+    if (u8 && u8.byteLength) pushBytes(u8);
   }
 
-  async function flushStatementAll(i: number) {
-    // Best-effort: flush any rows left for this statement
-    await flushStatementBatch(i);
-    rowsByStmt.delete(i);
+  // --- Flushing --------------------------------------------------------------
+
+  function flushStatementBatch(i: number) {
+    const b = byStmt.get(i);
+    if (!b) return;
+
+    // Priority: arrays -> objects -> json
+    if (b.arrayRows.length) {
+      const objs = toObjectsFromArrays(b.cols, b.arrayRows);
+      b.arrayRows.length = 0;
+      emitTableIpc(objs);
+      return;
+    }
+    if (b.objectRows?.length) {
+      const objs = b.objectRows;
+      b.objectRows = [];
+      emitTableIpc(objs);
+      return;
+    }
+    if (b.jsonRows?.length) {
+      const rows = b.jsonRows;
+      b.jsonRows = [];
+      b.jsonBytes = 0;
+      emitTableIpc(toObjectsFromJsonBatch(rows));
+    }
   }
+
+  function flushStatementAll(i: number) {
+    flushStatementBatch(i);
+    byStmt.delete(i);
+  }
+
+  // --- Encoder ---------------------------------------------------------------
 
   return {
     stream,
+
+    onSchema: (i, columns) => {
+      ensureBucket(i).cols = columns.slice();
+    },
+
+    emitArrayRow: (i, row) => {
+      const b = ensureBucket(i);
+      b.arrayRows.push(row);
+      if (b.arrayRows.length >= BATCH_ROWS) flushStatementBatch(i);
+    },
+
+    emitRow: (i, rowJson) => {
+      const b = ensureBucket(i);
+      if (!b.jsonRows) {
+        b.jsonRows = [];
+        b.jsonBytes = 0;
+      }
+      b.jsonRows.push(rowJson);
+      b.jsonBytes += rowJson.length + 1; // include comma
+      if (b.jsonRows.length >= BATCH_ROWS || b.jsonBytes >= JSON_MAX_BYTES) {
+        flushStatementBatch(i);
+      }
+    },
+
     emit: (type, payload) => {
-      // When summary for a statement arrives, emit its remaining Arrow batches
+      if (type === "row" && payload && typeof payload === "object") {
+        const { statement, row } = payload as { statement: number; row: unknown };
+        const b = ensureBucket(statement);
+        const r = row && typeof row === "object" && !Array.isArray(row)
+          ? (row as Record<string, unknown>)
+          : ({ value: row as unknown } as Record<string, unknown>);
+        (b.objectRows ??= []).push(r);
+        if (b.objectRows.length >= BATCH_ROWS) flushStatementBatch(statement);
+        return;
+      }
+
+      // Per-statement summary triggers full flush
       if (type === "summary" && payload && typeof payload === "object") {
         const idx = (payload as { statement?: unknown }).statement;
-        if (typeof idx === "number") {
-          // Fire and forget within the same microtask queue.
-          void flushStatementAll(idx);
-        }
+        if (typeof idx === "number") flushStatementAll(idx);
       }
-      // Other events are ignored for Arrow.
     },
-    emitRow: (i, rowJson) => {
-      try {
-        const obj = JSON.parse(rowJson) as Record<string, unknown>;
-        let arr = rowsByStmt.get(i);
-        if (!arr) {
-          arr = [];
-          rowsByStmt.set(i, arr);
-        }
-        arr.push(obj);
 
-        // Batch flush once we reach BATCH_ROWS for this statement
-        if (arr.length >= BATCH_ROWS) {
-          // Flush current batch and keep buffering new rows afterwards
-          // Note: we copy the array reference and replace with a fresh one
-          const toFlush = arr.slice(0);
-          rowsByStmt.set(i, []);
-          (async () => {
-            const table = tableFromJSON(toFlush);
-            const writer = new RecordBatchWriter();
-            await writer.writeAll(table).finish();
-            for await (const chunk of writer) {
-              pushBytes(chunk);
-            }
-          })();
-        }
-      } catch {
-        // ignore malformed rows (shouldn't happen)
-      }
-    },
+    // Prefer the most efficient upstream delivery when available.
+    preferArrays: true,
+    preferObjects: true,
+
     close: () => {
-      // Best-effort flush for any statements that didn't see a summary (errors/early close).
-      const pending = Array.from(rowsByStmt.keys());
-      (async () => {
-        for (const i of pending) {
-          await flushStatementAll(i);
-        }
+      try {
+        for (const i of byStmt.keys()) flushStatementAll(i);
+      } finally {
         close();
-      })();
+      }
     },
   };
 }

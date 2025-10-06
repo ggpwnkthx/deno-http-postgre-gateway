@@ -1,17 +1,12 @@
-import { createLineStream } from "./base.ts";
+import { abToBase64, createChunkStream, encodeUtf8, u8ToBase64 } from "./base.ts";
 import type { StreamEncoder } from "./types.ts";
 import type { PerfCtx } from "../../../shared/perf.ts";
 
 /**
- * CSV streaming:
- * - Writes metadata/events as comment lines starting with '# ' (so tools can ignore).
- * - For each statement index, emits a header row on first row ("col1,col2,...").
- * - Rows follow in stable column order derived from the first row.
- * - Non-scalar values are JSON-stringified in cells.
- *
- * Performance refactor:
- * - Cache the per-statement section header string.
- * - Avoid repeated string concatenations by prebuilding header+prefix once.
+ * CSV encoder pushing bytes directly:
+ * - Emits tokens/cells as separate chunks (no big string joins).
+ * - Header cached per statement; comment/meta lines emitted as bytes.
+ * - Prefers array/object rows (no JSON.parse on hot path).
  */
 export function createCsvEncoder(
   flushEvery: number,
@@ -19,7 +14,7 @@ export function createCsvEncoder(
   onCancel?: () => void,
   perf?: PerfCtx,
 ): StreamEncoder {
-  const { stream, push, close } = createLineStream(
+  const { stream, pushBytes, close } = createChunkStream(
     flushEvery,
     flushIntervalMs,
     undefined,
@@ -27,88 +22,128 @@ export function createCsvEncoder(
     perf,
   );
 
-  // Track per-statement column order and cached header strings
+  // Per-statement schema and header cache
   const colsByStmt = new Map<number, string[]>();
-  const sectionHeaderCache = new Map<number, string>();
+  const headerEmitted = new Set<number>();
 
-  const sectionHeader = (i: number) => {
-    let s = sectionHeaderCache.get(i);
-    if (!s) {
-      s = `# statement:${i}\n`;
-      sectionHeaderCache.set(i, s);
+  const NL = encodeUtf8("\n");
+  const COMMA = encodeUtf8(",");
+  const HASH_SPACE = encodeUtf8("# ");
+  const SECTION_PFX_CACHE = new Map<number, Uint8Array>();
+
+  const sectionHeaderBytes = (i: number): Uint8Array => {
+    let u8 = SECTION_PFX_CACHE.get(i);
+    if (!u8) {
+      u8 = encodeUtf8(`# statement:${i}\n`);
+      SECTION_PFX_CACHE.set(i, u8);
     }
-    return s;
+    return u8;
   };
 
-  function emitComment(obj: unknown) {
+  const emitComment = (obj: unknown) => {
     try {
-      push(`# ${JSON.stringify(obj)}\n`);
+      pushBytes(HASH_SPACE);
+      pushBytes(encodeUtf8(JSON.stringify(obj)));
+      pushBytes(NL);
     } catch {
       // best effort
     }
-  }
+  };
 
-  function toCsvCell(v: unknown): string {
-    // normalize special scalars used by jsonReplacer in other encoders
-    if (v instanceof Uint8Array) {
-      let bin = "";
-      for (let i = 0; i < v.length; i++) bin += String.fromCharCode(v[i]);
-      v = `base64:${btoa(bin)}`;
-    } else if (v instanceof ArrayBuffer) {
-      const view = new Uint8Array(v);
-      let bin = "";
-      for (let i = 0; i < view.length; i++) bin += String.fromCharCode(view[i]);
-      v = `base64:${btoa(bin)}`;
+  const csvEscape = (s: string): string => {
+    if (
+      s.indexOf('"') === -1 && s.indexOf(",") === -1 && s.indexOf("\n") === -1 &&
+      s.indexOf("\r") === -1
+    ) {
+      return s;
     }
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+
+  const toCsvCell = (v: unknown): string => {
+    if (v instanceof Uint8Array) v = u8ToBase64(v);
+    else if (v instanceof ArrayBuffer) v = abToBase64(v);
 
     if (v === null || v === undefined) return "";
-    if (typeof v === "string") return csvEscape(v);
-    if (typeof v === "number" || typeof v === "bigint" || typeof v === "boolean") {
-      return String(v);
+    switch (typeof v) {
+      case "string":
+        return csvEscape(v);
+      case "number":
+      case "bigint":
+      case "boolean":
+        return String(v);
+      default:
+        try {
+          return csvEscape(JSON.stringify(v));
+        } catch {
+          return csvEscape(String(v));
+        }
     }
-    try {
-      return csvEscape(JSON.stringify(v));
-    } catch {
-      return csvEscape(String(v));
-    }
-  }
+  };
 
-  function csvEscape(s: string): string {
-    const needs = /[",\n\r]/.test(s);
-    const doubled = s.replace(/"/g, '""');
-    return needs ? `"${doubled}"` : doubled;
-  }
+  const emitHeaderIfNeeded = (i: number, cols: string[]) => {
+    if (headerEmitted.has(i)) return;
+    pushBytes(sectionHeaderBytes(i));
+    for (let c = 0; c < cols.length; c++) {
+      if (c > 0) pushBytes(COMMA);
+      pushBytes(encodeUtf8(csvEscape(cols[c])));
+    }
+    pushBytes(NL);
+    headerEmitted.add(i);
+  };
 
   return {
     stream,
-    emit: (_type, payload) => {
-      emitComment(payload);
+
+    onSchema: (i, columns) => {
+      colsByStmt.set(i, columns.slice());
     },
-    emitRow: (i, rowJson) => {
-      let obj: Record<string, unknown> | null = null;
-      try {
-        obj = JSON.parse(rowJson) as Record<string, unknown>;
-      } catch {
-        obj = null;
+
+    emitArrayRow: (i, row) => {
+      let cols = colsByStmt.get(i);
+      if (!cols) {
+        cols = row.map((_v, idx) => `col${idx + 1}`);
+        colsByStmt.set(i, cols);
       }
-      if (!obj || typeof obj !== "object") {
-        emitComment({ statement: i, row: rowJson });
+      emitHeaderIfNeeded(i, cols);
+
+      for (let c = 0; c < row.length; c++) {
+        if (c > 0) pushBytes(COMMA);
+        pushBytes(encodeUtf8(toCsvCell(row[c])));
+      }
+      pushBytes(NL);
+    },
+
+    emit: (type, payload) => {
+      if (type === "row" && payload && typeof payload === "object") {
+        const { statement, row } = payload as { statement: number; row: Record<string, unknown> };
+        if (!row || typeof row !== "object" || Array.isArray(row)) {
+          emitComment({ statement, row });
+          return;
+        }
+
+        let cols = colsByStmt.get(statement);
+        if (!cols) {
+          cols = Object.keys(row);
+          colsByStmt.set(statement, cols);
+        }
+        emitHeaderIfNeeded(statement, cols);
+
+        for (let c = 0; c < cols.length; c++) {
+          if (c > 0) pushBytes(COMMA);
+          pushBytes(encodeUtf8(toCsvCell(row[cols[c]])));
+        }
+        pushBytes(NL);
         return;
       }
 
-      let cols = colsByStmt.get(i);
-      if (!cols) {
-        cols = Object.keys(obj);
-        colsByStmt.set(i, cols);
-
-        // Section header + header row (cache small prefix)
-        push(sectionHeader(i));
-        push(cols.map((c) => csvEscape(c)).join(",") + "\n");
-      }
-
-      const cells = cols.map((c) => toCsvCell((obj as Record<string, unknown>)[c]));
-      push(cells.join(",") + "\n");
+      // Non-row events -> comment lines (JSON)
+      emitComment(payload);
     },
+
+    preferArrays: true,
+    preferObjects: true,
+
     close,
   };
 }

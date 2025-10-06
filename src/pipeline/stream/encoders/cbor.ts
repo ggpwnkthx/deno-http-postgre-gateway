@@ -6,15 +6,12 @@ import { cborEncode } from "../../../deps.ts";
 /**
  * CBOR streaming with record batching.
  *
- * Wire notes:
- * - Rows are batched into a single CBOR document shaped as:
- *     { rows: [ { statement: number, row: <object> }, ... ] }
- * - Non-row events are emitted as their own standalone CBOR documents.
+ * Modes:
+ * - Receives native arrays/objects; no JSON.parse. Binary stays Uint8Array.
  *
- * Batching policy:
- * - batchSize = flushEvery (if > 0) else 1024 (default)
+ * Batching:
+ * - batchSize = flushEvery (if > 0) else 1024.
  * - Flush pending rows BEFORE emitting any non-row event to preserve ordering.
- * - Always flush remaining rows on close().
  */
 export function createCborEncoder(
   flushEvery: number,
@@ -25,53 +22,48 @@ export function createCborEncoder(
   const { stream, pushBytes, close } = createChunkStream(
     flushEvery,
     flushIntervalMs,
+    undefined,
     onCancel,
     perf,
   );
 
-  // Use flushEvery as the logical record batch size; fall back to 1024
   const batchSize = flushEvery > 0 ? flushEvery : 1024;
 
   type RowItem = { statement: number; row: unknown };
-  let rowsBatch: RowItem[] = [];
+  const rowsBatch: RowItem[] = [];
 
-  function hasBase64Sentinel(s: string) {
-    return s.indexOf("base64:") !== -1;
-  }
-
-  function flushRowsBatch() {
-    if (rowsBatch.length === 0) return;
+  const flushRowsBatch = () => {
+    if (!rowsBatch.length) return;
     try {
-      // Single CBOR document for the entire batch
       pushBytes(cborEncode({ rows: rowsBatch }));
     } finally {
       rowsBatch.length = 0;
     }
-  }
+  };
 
   return {
     stream,
-    emit: (_type, payload) => {
-      // Preserve ordering: flush row batch before other events
+
+    emitArrayRow: (i, row) => {
+      rowsBatch.push({ statement: i, row });
+      if (rowsBatch.length >= batchSize) flushRowsBatch();
+    },
+
+    emit: (type, payload) => {
+      if (type === "row") {
+        const p = payload as { statement: number; row: unknown };
+        rowsBatch.push({ statement: p.statement, row: p.row });
+        if (rowsBatch.length >= batchSize) flushRowsBatch();
+        return;
+      }
+      // Preserve ordering for non-row events
       flushRowsBatch();
       pushBytes(cborEncode(payload));
     },
-    emitRow: (i, rowJson) => {
-      // Only revive binary if we actually see the "base64:" sentinel.
-      let row: unknown;
-      try {
-        row = hasBase64Sentinel(rowJson)
-          ? JSON.parse(rowJson, jsonReviverFast)
-          : JSON.parse(rowJson);
-      } catch {
-        row = rowJson; // keep the stream valid in pathological cases
-      }
 
-      rowsBatch.push({ statement: i, row });
-      if (rowsBatch.length >= batchSize) {
-        flushRowsBatch();
-      }
-    },
+    preferArrays: true,
+    preferObjects: true,
+
     close: () => {
       try {
         flushRowsBatch();
@@ -80,20 +72,4 @@ export function createCborEncoder(
       }
     },
   };
-}
-
-/** Inverse of jsonReplacer for base64:… only (typed binary revival). */
-function jsonReviverFast(_k: string, v: unknown) {
-  if (typeof v === "string" && v.startsWith("base64:")) {
-    const b64 = v.slice(7);
-    try {
-      const bin = atob(b64);
-      const u8 = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-      return u8;
-    } catch {
-      return v;
-    }
-  }
-  return v as unknown;
 }
